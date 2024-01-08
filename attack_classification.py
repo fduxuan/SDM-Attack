@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 '''
 Created on: 2022-12-08 06:53:08
-LastEditTime: 2022-12-14 04:58:19
+LastEditTime: 2023-01-04 11:59:23
 Author: fduxuan
 
 Desc:    export HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1
@@ -61,6 +61,7 @@ class AttackClassification:
         self.mode = mode
 
         self.random = False
+        self.max_length = 396
         
         self.USE = USE("d", "./data/USE_Model", "dd")
         
@@ -78,16 +79,17 @@ class AttackClassification:
         self.cos_sim = np.load(self.counter_fitting_cos_sim_path)
         finish() 
 
-    def read_data(self, length=368) -> List[ClassificationItem]:
+    def read_data(self) -> List[ClassificationItem]:
         if self.mode == 'eval':
         # if True:
             texts, labels = dataloader.read_corpus(self.dataset_path)
             data = list(zip(texts, labels))
-            data = [ClassificationItem(words=x[0][:length], label=int(x[1]))for x in data]
+            data = [ClassificationItem(words=x[0], label=int(x[1]))for x in data]
         elif self.mode == 'train':
+        # if True:
             dataset = load_dataset(self.dataset_path)
-            train = list(dataset['train'])[:5000]
-            data = [ClassificationItem(words=x['text'].lower().split()[:length], label=int(x['label']))for x in train]
+            train = list(dataset['train'])[:1000]
+            data = [ClassificationItem(words=x['text'].lower().split(), label=int(x['label']))for x in train]
         info("Data import finished!")
         return data
     
@@ -95,6 +97,41 @@ class AttackClassification:
         word_n_pos_list = nltk.pos_tag(org_text, tagset="universal")
         _, pos_list = zip(*word_n_pos_list)
         return pos_list
+    
+    def get_import_score(self, item, words, orig_probability):
+        new_words = []
+        for i in range(len(words)):
+            _words = words.copy()
+            if _words[i] != '[SEP]':
+                _words[i] = self.victim.tokenizer.unk_token
+            new_words.append(_words)
+        probability = self.victim.text_pred(new_words)
+        attack_labels = torch.argmax(probability, dim=-1)
+        scores = orig_probability[item.label] - probability[:, item.label]
+        for i in range(len(probability)):
+            attack_label = attack_labels[i]
+            if attack_label != item.label:
+                scores[i] += probability[i][attack_label] - orig_probability[attack_label]
+        _, slices = scores.sort(descending=True)
+        return slices
+    
+    def get_import_score2(self, item, words, orig_probability, synonyms):
+        new_words = []
+        for i in range(len(words)):
+            _words = words.copy()
+            if _words[i] != '[SEP]':
+                _words[i] = self.victim.tokenizer.unk_token
+            new_words.append(_words)
+        probability = self.victim.text_pred(new_words)
+        attack_labels = torch.argmax(probability, dim=-1)
+        scores = orig_probability[item.label] - probability[:, item.label]
+        for i in range(len(probability)):
+            attack_label = attack_labels[i]
+            if attack_label != item.label:
+                scores[i] += probability[i][attack_label] - orig_probability[attack_label]
+        _, slices = scores.sort(descending=True)
+        return slices
+    
 
     def find_synonyms(self, words: list, k: int = 50, threshold=0.7):
         """ 从 cos sim 文件中获取同义词
@@ -130,67 +167,89 @@ class AttackClassification:
             state += [0] * len(ids) if i in pool else [1]*len(ids)
             word2token[i] = (len(input_ids), len(input_ids) + len(ids))  # 左闭右开
             input_ids += ids
+        length = len(input_ids)
+        if length > 512:  # 目前512
+            input_ids = input_ids[0: 511] + [input_ids[-1]]
+            state = state[:512]
+            
         encode_data = {'input_ids': torch.tensor([input_ids]).to(self.discriminator.device)}
         state_infos = torch.tensor(state).unsqueeze(dim=0).unsqueeze(dim=-1).to(self.discriminator.device)
         
         logits = self.discriminator(state_infos, **encode_data)
         return state, word2token, logits
 
-    def replace(self, origin_words, origin_label, words: list, index, synonyms: dict, org_pos):
-        word = words[index]
-        syn = synonyms.get(word, [])
-        org_text = words[1: -1]
-        org_pos = self.check_pos(org_text)
-        threshold = 0.1
-        last_prob = self.victim.text_pred([words]).cpu()[0][origin_label]
-        if len(org_text) < 15:
-            threshold = 0.1
+    def replace(self, origin_words, origin_label, words: list, word_indexs, synonyms: dict, org_pos):
+        res = [] 
+        windows_size = 50 if self.mode == 'eval' else 15 
+        for index in  word_indexs:
+            word = words[index]
+            syn = synonyms.get(word, [])
+            org_text = words[1: -1]
+            org_text_small = words[max(1, index-windows_size): min(len(words)-1, index+windows_size)]
+            org_pos = self.check_pos(org_text)
+            threshold = 0.7
             
-        batch_data = [] #(words, syn, sim)
-        for s in syn:
-            item = words[1: index] + [s[0]] + words[index+1: -1]
-            adv_pos = self.check_pos(item)
-            # adv_pos = org_pos
-            if adv_pos[index-1] == org_pos[index-1] or (set([adv_pos[index-1], org_pos[index-1]])<= set(['NOUN', 'VERB'])):
-                # sim_score = self.USE.semantic_sim([" ".join(org_text)], [" ".join(item)])[0].item()
-                sim_score = 1
-                if sim_score > threshold:  
-                    # if True:
-                    batch_data.append((item, s, sim_score))
-                
-        
-        if len(batch_data) == 0:
-            return None, None
-        
-        probability = self.victim.text_pred([x[0] for x in batch_data], batch_size=50)
-        
-        scores = probability[:, origin_label]
-        _, slices = scores.sort()
-        
-        if scores[slices[0]] < 0.5:
-            a = []
-            for x in slices:
-                if scores[x] < 0.5:
-                    a.append([batch_data[x][0], probability[x], self.USE.semantic_sim([" ".join(org_text)], [" ".join(batch_data[x][0])])[0].item()])
-                else:
-                    break
-            a = sorted(a, key=lambda x: x[2], reverse=True)
-            return a[0][0], a[0][1]
-        # else:
-        #     flag = scores[slices[0]]
+            if len(org_text_small) < 15:
+                threshold = 0.1
+            # threshold = 0.3
+            batch_data = [] #(words, syn, sim)
+            for s in syn:
+                item = words[1: index] + [s[0]] + words[index+1: -1]
+                item_small = words[max(1, index-windows_size): index] + [s[0]] + words[index+1: min(len(words)-1, index+windows_size)]
+                adv_pos = self.check_pos(item)
+             
+                if not(adv_pos[index-1] == org_pos[index-1] or (set([adv_pos[index-1], org_pos[index-1]])<= set(['NOUN', 'VERB']))):
+                    continue
+                sim_score = self.USE.semantic_sim([" ".join(org_text_small)], [" ".join(item_small)])[0].item()
+                if sim_score > threshold:
+                    # batch_data.append((item, s, item_small))
+                    batch_data.append((item_small, s))
+                    
+            
+            if len(batch_data) == 0:
+                res.append((None, index, 1, False))
+                continue
+            with torch.no_grad():
+                probability = self.victim.text_pred([x[0] for x in batch_data], batch_size=50)
+            
+            scores = probability[:, origin_label]
+            _, slices = scores.sort()
+            
+            last_prob = self.victim.text_pred([org_text_small]).cpu()[0][origin_label]
+            if scores[slices[0]] >= last_prob:
+                res.append((None, index, scores[slices[0]], False))
+                continue
+            
+            res.append(([batch_data[x][1] for x in slices], index, scores[slices[0]]))
+            # return [batch_data[x][1] for x in slices]
+        res = sorted(res, key=lambda x: x[2])  
+        if len(res) == 0:
+            return None, 0
+        return res[0][0], res[0][1]
+        # if scores[slices[0]] < 0.5:
         #     a = []
         #     for x in slices:
-        #         if scores[x] - flag <= 0.001:
-        #             a.append([batch_data[x][0], probability[x], batch_data[x][2]])
+        #         if scores[x] < 0.5:
+        #             a.append([batch_data[x][0], probability[x], self.USE.semantic_sim([" ".join(org_text)], [" ".join(batch_data[x][0])])[0].item()])
         #         else:
         #             break
-        #     a = sorted(a, key=lambda x: x[2], reverse=True) 
-        #     return a[0][0], a[0][1] 
-        if scores[slices[0]]  >= last_prob:
-            return None, None   
-        return batch_data[slices[0]][0], probability[slices[0]]  # 在对应标签上最低的
+        #     a = sorted(a, key=lambda x: x[2], reverse=True)
+        #     return a[0][0], a[0][1]
+        # # else:
+        # #     flag = scores[slices[0]]
+        # #     a = []
+        # #     for x in slices:
+        # #         if scores[x] - flag <= 0.001:
+        # #             a.append([batch_data[x][0], probability[x], batch_data[x][2]])
+        # #         else:
+        # #             break
+        # #     a = sorted(a, key=lambda x: x[2], reverse=True) 
+        # #     return a[0][0], a[0][1] 
+        # if scores[slices[0]]  >= last_prob:
+        #     return None, None   
+        # return batch_data[slices[0]][0], probability[slices[0]]  # 在对应标签上最低的
     
-    def do_discrimination(self, state, word2token, logits):
+    def do_discrimination(self, state, word2token, logits, candidate_size=1):
         """进行一次判别
         根据pool生成state_info  
         Args:
@@ -213,23 +272,30 @@ class AttackClassification:
                 token_index_p.append(v.item())
                 
         if self.random:
-            token_index = random.choice(token_index_list)
+            token_indexs = [random.choice(token_index_list)]
         
         else:
             # if self.mode == 'eval':
             if True:
                 _, slices = torch.tensor(token_index_p).sort(descending=True)  # 降序取最大
-                token_index = token_index_list[slices[0]]
+                token_indexs = []
+                for i in range(min(candidate_size, len(slices))):
+                    token_index = token_index_list[slices[i].item()]
+                    token_indexs.append(token_index)
             # else:
             #     # token_index_p = np.array(torch.nn.functional.softmax(torch.tensor(token_index_p), dim=-1))
             #     sub = 1 - sum(token_index_p)
             #     token_index_p = [x + sub/len(token_index_p) for x in token_index_p]
             #     token_index = np.random.choice(token_index_list, p=np.array(token_index_p).ravel())
-        word_index = 0
-        for i in word2token:
-            if word2token[i][0]<= token_index and word2token[i][1] > token_index:
-                word_index = i
-        return word_index, word2token[word_index][0], logits
+        word_indexs = set()
+        for token_index in token_indexs:   
+            word_index = 0
+            for i in word2token:
+                if word2token[i][0]<= token_index and word2token[i][1] > token_index:
+                    word_index = i
+            word_indexs.add(word_index)
+        word_indexs = list(word_indexs)
+        return word_indexs, 1, 1
     
     def attack(self, item: ClassificationItem, attempts: int = 50):
         """success: 0 --> 本身不正确
@@ -254,7 +320,7 @@ class AttackClassification:
 
         
         # org_pos = None
-        synonyms = self.find_synonyms(words, k=self.synonym_num, threshold=self.sim_score_threshold)
+        synonyms = self.find_synonyms(words, k=self.synonym_num, threshold=0.5)
         for key, w in enumerate(words):
             if w in self.stop_words or w in ['[CLS]', '[SEP]'] or w in string.punctuation or w not in synonyms:
                 pool.add(key)
@@ -286,13 +352,20 @@ class AttackClassification:
                     orig_prob= self.victim.text_pred([words[1:-1]])[0]
                     state, word2token, logits = self.encode_state(words, pool)
                     
-                    word_index, token_index, logits = self.do_discrimination(state, word2token, logits)
+                    word_indexs, _, _ = self.do_discrimination(state, word2token, logits)
 
                     # 修改状态池
+                    
+                    
+                    syns, word_index = self.replace(origin_words, orig_label, words, word_indexs, synonyms, org_pos)  #(word, sim_score)
+                # # 进入victim model
                     pool.add(word_index)
-                    syn = self.replace(origin_words, orig_label, words, word_index, synonyms, org_pos)  #(word, sim_score)
-                    # 进入victim model
-                    words[word_index] = syn[0]
+                    if syns is None:
+                        # pool.add(word_index)
+                        continue
+    
+                    words[word_index] = syns[0][0]
+                    token_index = word2token[word_index][0]
                     new_text = " ".join(words[1:-1])
                     attack_prob = self.victim.text_pred([words[1:-1]])[0]
                     attack_label = torch.argmax(attack_prob, dim=-1)
@@ -342,6 +415,74 @@ class AttackClassification:
             
         return res
 
+    def attack_probability(self, item: ClassificationItem, num: int = 0):
+        """ 概率mask下降scores 
+            success: 0 --> 本身不正确
+                    1 --> perturb超过0.4  attack失败
+                    2 --> attack成功
+        """
+        org_text = " ".join(item.words)
+        orig_prob = self.victim.text_pred([item.words]).cpu()[0]
+        orig_label = torch.argmax(orig_prob, dim=-1)
+        res = {'success': 0, 'org_label': item.label, 'org_seq': org_text, 'adv_seq': org_text, 'change': []}
+        if item.label != orig_label:  # 本身不正确，不进行attack
+            return res
+        res['success'] = 1  
+        # 初始化环境
+        pool = set()
+        synonyms = self.find_synonyms(item.words, k=self.synonym_num, threshold=0.5)
+        for key, w in enumerate(item.words):
+                if w in self.stop_words or w in ['[CLS]', '[SEP]'] or w in string.punctuation or w not in synonyms:
+                    pool.add(key)
+        important_slice = self.get_import_score(item, words, orig_prob)
+        change = []
+        step = 0
+        perturb = 0
+        origin_words = ['[CLS]']+ item.words +['[SEP]']
+        words = ['[CLS]']+ item.words +['[SEP]']
+        for index in important_slice:
+            if index in pool:
+                continue
+            syns, word_index = self.replace(item.words, orig_label, words, [index+1], synonyms, None)
+            if syns is None:
+                continue
+            new_words = words[0: word_index] + [syns[0][0]] + words[word_index+1:]
+            
+            new_text = " ".join(new_words[1:-1])
+            attack_prob = self.victim.text_pred([new_words[1:-1]])[0].cpu()
+            attack_label = torch.argmax(attack_prob, dim=-1)
+            sim_score = self.USE.semantic_sim([" ".join(words[1:-1])], [new_text])[0].item()
+            if attack_label != orig_label:
+                for s in  syns[1:]:
+                    tmp_words = words[0: word_index] + [s[0]] + words[word_index+1:]
+                    tmp_attack_prob = self.victim.text_pred([tmp_words[1:-1]])[0].cpu()
+                    tmp_attack_label = torch.argmax(tmp_attack_prob, dim=-1)
+                    if tmp_attack_label == orig_label:
+                        break
+                    tmp_sim_score = self.USE.semantic_sim([" ".join(words[1:-1])], [" ".join(tmp_words[1:-1])])[0].item()
+                    if tmp_sim_score > sim_score:
+                        sim_score = tmp_sim_score
+                        attack_label = tmp_attack_label
+                        new_words = tmp_words
+                        new_text = " ".join(new_words[1:-1])
+                            
+            words = new_words
+            change.append([word_index, origin_words[word_index], words[word_index]])
+            step += 1
+            perturb = len(change)/len(item.words)
+            if perturb > self.perturb_ratio:
+                break
+            if attack_label != orig_label:
+                if perturb < self.perturb_ratio:
+                    min_step = step
+                    flag = 1
+                    res['success'] = 2
+                    res['adv_label'] = attack_label.item()
+                    res['adv_seq'] = new_text
+                    res['change'] = change
+                    res['perturb'] = perturb
+                    break           
+        return res
 
     def attack_eval(self, item: ClassificationItem, num: int = 0):
         """success: 0 --> 本身不正确
@@ -367,7 +508,7 @@ class AttackClassification:
             words = ['[CLS]']+ item.words +['[SEP]']
             
             
-            synonyms = self.find_synonyms(words, k=self.synonym_num, threshold=self.sim_score_threshold)
+            synonyms = self.find_synonyms(words, k=self.synonym_num, threshold=0.5)
             for key, w in enumerate(words):
                 if w in self.stop_words or w in ['[CLS]', '[SEP]'] or w in string.punctuation or w not in synonyms:
                     pool.add(key)
@@ -376,19 +517,37 @@ class AttackClassification:
             origin_words = words.copy()
             step = 0
             while len(pool) < len(words):
-                encode_state, state, word2token = self.encode_state(words, pool)         
-                word_index, token_index, logits = self.do_discrimination(encode_state, state, word2token)
-                pool.add(word_index)    
-                new_words, attack_prob = self.replace(origin_words, orig_label, words, word_index, synonyms, org_pos)  #(word, sim_score)
+                encode_state, word2token, logits = self.encode_state(words, pool)         
+                word_indexs, _, _ = self.do_discrimination(encode_state, word2token, logits)
+                
+                syns, word_index = self.replace(origin_words, orig_label, words, word_indexs, synonyms, org_pos)  #(word, sim_score)
                 # # 进入victim model
-                if new_words is None:
+                pool.add(word_index)    
+                if syns is None:
                     # pool.add(word_index)
                     continue
-                words = ["[CLS]"] + new_words + ['SEP']
-                new_text = " ".join(words[1:-1])
-                # attack_prob = self.victim.text_pred([words[1:-1]])[0].cpu()
-                attack_label = torch.argmax(attack_prob, dim=-1)
                 
+                new_words = words[0: word_index] + [syns[0][0]] + words[word_index+1:]
+                token_index = word2token[word_index][0]
+                new_text = " ".join(new_words[1:-1])
+                attack_prob = self.victim.text_pred([new_words[1:-1]])[0].cpu()
+                attack_label = torch.argmax(attack_prob, dim=-1)
+                sim_score = self.USE.semantic_sim([" ".join(words[1:-1])], [new_text])[0].item()
+                if attack_label != orig_label:
+                    for s in  syns[1:]:
+                        tmp_words = words[0: word_index] + [s[0]] + words[word_index+1:]
+                        tmp_attack_prob = self.victim.text_pred([tmp_words[1:-1]])[0].cpu()
+                        tmp_attack_label = torch.argmax(tmp_attack_prob, dim=-1)
+                        if tmp_attack_label == orig_label:
+                            break
+                        tmp_sim_score = self.USE.semantic_sim([" ".join(words[1:-1])], [" ".join(tmp_words[1:-1])])[0].item()
+                        if tmp_sim_score > sim_score:
+                            sim_score = tmp_sim_score
+                            attack_label = tmp_attack_label
+                            new_words = tmp_words
+                            new_text = " ".join(new_words[1:-1])
+                            
+                words = new_words
                 change.append([word_index, origin_words[word_index], words[word_index]])
                 step += 1
                 perturb = len(change)/len(item.words)
@@ -407,7 +566,7 @@ class AttackClassification:
             return res
     
     def run(self):
-        data = self.read_data()
+        data = self.read_data()[500:]
         bar = tqdm.tqdm(data)
         acc = 0
         attack_total = 0
@@ -415,39 +574,62 @@ class AttackClassification:
         perturb = 0.0
         ans = []
         attack_func = self.attack
+        sim_scores = 0
+        attack_success = 0
         # self.discriminator = Discriminator(self.checkpoint)
         if self.mode == 'eval':
             # self.discriminator = Discriminator(self.checkpoint)
             self.discriminator.eval()
             self.victim.eval()
             attack_func = self.attack_eval
+            # attack_func = self.attack_probability
+            
         for i, item in enumerate(bar):
             try:
                 res = attack_func(item, 50)
             except Exception as e:
                 print(f"{e}")
                 raise e
+                
                 res = res = {'success': 1, 'org_label': item.label, 'org_seq': " ".join(item.words), 'adv_seq': " ".join(item.words),'change': []}
             ans.append(res)
+            
             if res['success'] == 1: # 没有攻击成功
                 acc += 1
                 attack_total += 1
+          
             elif res['success'] == 0:
+                # sim_scores += 1
                 pass
+
             elif res['success'] == 2:
+                sim_scores += self.USE.semantic_sim([res['org_seq']], [res['adv_seq']])[0].item()
                 perturb_total += 1
                 perturb += res['perturb']
                 attack_total += 1
             if perturb_total and attack_total:
-                bar.set_postfix({'acc': acc/(i+1), 'perturb': perturb/perturb_total, 'attack_rate': perturb_total/attack_total})
+                bar.set_postfix({'acc': acc/(i+1), 'perturb': perturb/perturb_total, 'attack_rate': perturb_total/(i+1), 'sim': sim_scores/perturb_total, 'org_acc': attack_total/(i+1)})
             if i % 100 == 0 and self.mode == 'train':
                 self.discriminator.saveModel(self.checkpoint)    
         import json
         json.dump(ans, open(self.output_file, 'w'))
-        print(f"acc: {acc/len(data)}\t perturb: {perturb/perturb_total}\t attack_rate: {perturb_total/attack_total}")
+        print(f"acc: {acc/len(data)}\t perturb: {perturb/perturb_total}\t attack_rate: {perturb_total/len(data)} \t sim: {sim_scores/perturb_total} \t org_acc: {attack_total/(len(data))}")
         info(f'dump {self.output_file}')
         if self.mode == 'train':
             self.discriminator.saveModel(self.checkpoint)
+    
+    def run_acc(self):
+        """原本acc
+        """
+        data = self.read_data()
+        bar = tqdm.tqdm(data)
+        acc = 0
+        for i, item in enumerate(bar):
+            prob = self.victim.text_pred([item.words[1:-1]])[0].cpu()
+            label = torch.argmax(prob, dim=-1)
+            if label == item.label:
+                acc += 1
+            bar.set_postfix({'acc': acc/(i+1)})
     
 def main():
     parser = argparse.ArgumentParser()
@@ -495,19 +677,21 @@ def main():
     info('Start attacking!' if args.mode == 'eval' else 'Start Training!')
     
     if args.target_model_mode == 'CNN':
-        victim = VictimModel(args.word_embeddings_path, cnn=True)
+        victim = VictimModelForCNN(args.word_embeddings_path, cnn=True)
         checkpoint = torch.load(args.target_model_path, map_location='cuda:0')
         victim.load_state_dict(checkpoint)
     elif args.target_model_mode == 'LSTM':
-        victim = VictimModel(args.word_embeddings_path, cnn=False)
+        victim = VictimModelForCNN(args.word_embeddings_path, cnn=False)
         checkpoint = torch.load(args.target_model_path, map_location='cuda:0')
         victim.load_state_dict(checkpoint)
     elif args.target_model_mode == 'transformer':
         victim = VictimModelForTransformer(args.target_model_path, num_labels=args.num_labels)
     
-    if args.mode == 'eval':
+    # if args.mode == 'eval':
+    if True:
         discriminator = Discriminator(args.discriminator_checkpoint)
-    
+    # else:
+    #     discriminator = Discriminator()
     a = AttackClassification(args.dataset_path, 
                   args.target_model_mode,
                   victim,
@@ -522,6 +706,7 @@ def main():
                   args.discriminator_checkpoint,
                   args.mode)
     a.run()
+    # a.run_acc()
     
     
 if __name__ == "__main__":

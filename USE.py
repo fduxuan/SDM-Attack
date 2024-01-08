@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 '''
 Created on: 2022-10-26 08:51:46
-LastEditTime: 2022-12-14 03:15:39
+LastEditTime: 2023-01-04 08:04:48
 Author: fduxuan
 
 Desc:  使用 Universal Sentence Encoder  计算相似度  conda activate tf
@@ -14,7 +14,8 @@ import tqdm
 import json
 import argparse
 from util import *
-
+from model import *
+import numpy as np
 
 tf.disable_v2_behavior()
 # os.environ['CUDA_VISIBLE_DEVICES'] = " "
@@ -59,24 +60,42 @@ class USE:
         return scores 
 
     def run(self):
-        sim = 0
+     
         acc = 0
-        perturb = 0
+        org_acc = 0
+        perturb = []
+        change_length = 0
+        words_length = 0
         count = 0
         data = json.load(open(self.result_path, 'r'))
         bar = tqdm.tqdm(data)
-        for d in bar:
+        attack_rate = 0
+        threshold = 0.5
+        sim = []
+        proportion = 0 # 大于 threshold的attack rate
+        for i, d in enumerate(bar):
+            perturb2 = d.get('perturb', 0)
+            if perturb2 > 0.4:
+                d['success'] = 1
+            # imdb 0.1
+            
+            
             acc += d['success'] == 1
+            org_acc += d['success']!=0
+            attack_rate += d['success'] == 2
             # if d['success'] == 2: # 统计攻击成功的
-            if True:
-                corr = self.semantic_sim([d['org_seq']], [d['adv_seq']])[0]
+            if d['success']==2:
+                corr = self.semantic_sim([d['org_seq']], [d['adv_seq']])[0].item()
+                sim.append(corr)
                 # corr = self.semantic_sim([d['seq_a']], [d['adv']])[0]
+                if d['success'] == 2 and corr > threshold:
+                    proportion += 1
+                perturb.append(len(d['change'])/len(d['org_seq'].split()))
                 
-                sim += corr
-                perturb += d.get('perturb', 0)     
+                
                 count += 1
-                bar.set_postfix({'sim': sim/count, 'perturb': perturb/count})
-        print(f'acc: {acc/len(data)}', f'sim: {sim/count}', f'perturb: {perturb/count}')
+                bar.set_postfix({'sim': np.mean(sim), 'perturb': np.mean(perturb), 'org_acc': org_acc/(i+1)})
+        print(f'acc: {acc/len(data)}', f'sim: {np.mean(sim)}', f"perturb: {np.mean(perturb)}", f"attack_rate: {count/len(data)}", f"proportion: {proportion/len(data)}", f"org_acc: {org_acc/len(data)}")
  
 
 
